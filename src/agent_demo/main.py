@@ -200,7 +200,9 @@ def run_task(
         valid, reason = validate_trace(trace)
         trace.record("validation.passed" if valid else "validation.failed", reason=reason)
         validation_passed = valid
-        return valid
+        if not valid:
+            raise ValueError(reason)
+        return True
 
     agent = ToolCallingAgent(
         tools=controller.as_agent_tools(),
