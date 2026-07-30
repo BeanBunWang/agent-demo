@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import os
 import subprocess
@@ -11,18 +12,35 @@ from typing import Any, Callable
 
 from smolagents import tool
 
-READ_EXTENSIONS = {".md", ".txt", ".json", ".csv"}
+READ_EXTENSIONS = {
+    ".md",
+    ".txt",
+    ".json",
+    ".csv",
+    ".py",
+    ".toml",
+    ".yaml",
+    ".yml",
+    ".example",
+}
 WRITE_EXTENSIONS = {".md", ".txt", ".json"}
 INTENTS = {
     "inspect_files",
+    "search_files",
+    "read_large_text",
     "summarize_text",
     "analyze_csv",
+    "analyze_json",
+    "project_check",
     "system_check",
     "mixed",
     "unsupported",
 }
 MAX_READ_BYTES = 64 * 1024
+MAX_CHUNK_FILE_BYTES = 2 * 1024 * 1024
 MAX_WRITE_BYTES = 128 * 1024
+MAX_CHUNK_LINES = 200
+MAX_SEARCH_RESULTS = 50
 
 
 class Trace:
@@ -41,7 +59,14 @@ class WorkspaceTools:
     def __init__(self, root: Path, trace: Trace) -> None:
         self.root = root.resolve()
         self.trace = trace
-        self.read_roots = tuple((self.root / name).resolve() for name in ("examples", "workspace"))
+        self.read_roots = tuple(
+            (self.root / name).resolve()
+            for name in ("examples", "workspace", "src", "tests", "skills")
+        )
+        self.read_files = tuple(
+            (self.root / name).resolve()
+            for name in ("README.md", "VALIDATION.md", "pyproject.toml", ".env.example")
+        )
         self.output_root = (self.root / "workspace" / "output").resolve()
 
     @staticmethod
@@ -63,9 +88,40 @@ class WorkspaceTools:
         if relative.is_absolute():
             raise ValueError("path_outside_workspace")
         target = (self.root / relative).resolve()
-        if not any(target == base or base in target.parents for base in self.read_roots):
+        in_root = any(target == base or base in target.parents for base in self.read_roots)
+        if not in_root and target not in self.read_files:
             raise ValueError("path_outside_workspace")
         return target
+
+    @staticmethod
+    def _sha256(target: Path) -> str:
+        digest = hashlib.sha256()
+        with target.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(64 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _json_type(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "boolean"
+        if isinstance(value, (int, float)):
+            return "number"
+        if isinstance(value, str):
+            return "string"
+        if isinstance(value, list):
+            return "array"
+        return "object"
+
+    def _search_bases(self, path: str) -> tuple[Path, ...]:
+        if path == ".":
+            return self.read_roots + tuple(item for item in self.read_files if item.exists())
+        target = self._resolve_read(path)
+        if not target.exists():
+            raise ValueError("path_not_found")
+        return (target,)
 
     def _resolve_output(self, path: str) -> Path:
         relative = Path(path)
@@ -109,23 +165,20 @@ class WorkspaceTools:
 
     def list_workspace(self, path: str = ".") -> str:
         def operation() -> dict[str, Any]:
-            if path == ".":
-                bases = self.read_roots
-            else:
-                target = self._resolve_read(path)
-                if not target.exists():
-                    raise ValueError("path_not_found")
-                if not target.is_dir():
-                    raise ValueError("not_a_directory")
-                bases = (target,)
+            bases = self._search_bases(path)
             files: list[str] = []
             for base in bases:
                 if not base.exists():
                     continue
+                if base.is_file():
+                    files.append(self._relative(base))
+                    continue
                 files.extend(
                     item.relative_to(self.root).as_posix()
                     for item in base.rglob("*")
-                    if item.is_file() and not item.is_symlink()
+                    if item.is_file()
+                    and not item.is_symlink()
+                    and item.suffix.lower() in READ_EXTENSIONS
                 )
             return {"ok": True, "path": path, "files": sorted(files)[:100]}
 
@@ -143,14 +196,124 @@ class WorkspaceTools:
             if target.stat().st_size > MAX_READ_BYTES:
                 raise ValueError("file_too_large")
             content = target.read_text(encoding="utf-8-sig")
-            return {
+            result = {
                 "ok": True,
                 "path": self._relative(target),
                 "bytes": target.stat().st_size,
                 "content": content,
+                "sha256": self._sha256(target),
             }
+            if target.suffix.lower() == ".json":
+                try:
+                    json.loads(content)
+                    result["json_valid"] = True
+                except json.JSONDecodeError:
+                    result["json_valid"] = False
+            return result
 
         return self._run("read_text", {"path": path}, operation)
+
+    def search_text(self, query: str, path: str = ".", max_results: int = 20) -> str:
+        def operation() -> dict[str, Any]:
+            term = query.strip()
+            if not term:
+                raise ValueError("empty_query")
+            if len(term) > 200:
+                raise ValueError("query_too_long")
+            if not 1 <= max_results <= MAX_SEARCH_RESULTS:
+                raise ValueError("invalid_max_results")
+            candidates: list[Path] = []
+            for base in self._search_bases(path):
+                if base.is_file():
+                    candidates.append(base)
+                elif base.is_dir():
+                    candidates.extend(item for item in base.rglob("*") if item.is_file())
+            matches: list[dict[str, Any]] = []
+            truncated = False
+            for target in sorted(set(candidates)):
+                if (
+                    target.is_symlink()
+                    or target.suffix.lower() not in READ_EXTENSIONS
+                    or target.stat().st_size > MAX_CHUNK_FILE_BYTES
+                ):
+                    continue
+                try:
+                    with target.open(encoding="utf-8-sig") as handle:
+                        for line_number, line in enumerate(handle, start=1):
+                            if term.casefold() not in line.casefold():
+                                continue
+                            if len(matches) == max_results:
+                                truncated = True
+                                break
+                            matches.append(
+                                {
+                                    "path": self._relative(target),
+                                    "line": line_number,
+                                    "text": line.strip()[:240],
+                                }
+                            )
+                except UnicodeError:
+                    continue
+                if truncated:
+                    break
+            return {
+                "ok": True,
+                "query": term,
+                "path": path,
+                "count": len(matches),
+                "truncated": truncated,
+                "matches": matches,
+            }
+
+        return self._run(
+            "search_text",
+            {"query": query, "path": path, "max_results": max_results},
+            operation,
+        )
+
+    def read_text_chunk(self, path: str, start_line: int = 1, max_lines: int = 100) -> str:
+        def operation() -> dict[str, Any]:
+            if start_line < 1:
+                raise ValueError("invalid_start_line")
+            if not 1 <= max_lines <= MAX_CHUNK_LINES:
+                raise ValueError("invalid_max_lines")
+            target = self._resolve_read(path)
+            if not target.exists():
+                raise ValueError("path_not_found")
+            if not target.is_file() or target.is_symlink():
+                raise ValueError("not_a_regular_file")
+            if target.suffix.lower() not in READ_EXTENSIONS:
+                raise ValueError("unsupported_extension")
+            if target.stat().st_size > MAX_CHUNK_FILE_BYTES:
+                raise ValueError("file_too_large")
+            lines: list[str] = []
+            has_more = False
+            with target.open(encoding="utf-8-sig") as handle:
+                for line_number, line in enumerate(handle, start=1):
+                    if line_number < start_line:
+                        continue
+                    if len(lines) == max_lines:
+                        has_more = True
+                        break
+                    lines.append(line)
+            if not lines:
+                raise ValueError("line_out_of_range")
+            return {
+                "ok": True,
+                "path": self._relative(target),
+                "start_line": start_line,
+                "end_line": start_line + len(lines) - 1,
+                "has_more": has_more,
+                "bytes": target.stat().st_size,
+                "sha256": self._sha256(target),
+                "content": "".join(lines),
+            }
+
+        return self._run(
+            "read_text_chunk",
+            {"path": path, "start_line": start_line, "max_lines": max_lines},
+            operation,
+        )
 
     @staticmethod
     def _number(value: float) -> int | float:
@@ -213,6 +376,56 @@ class WorkspaceTools:
 
         return self._run("analyze_csv", {"path": path}, operation)
 
+    def analyze_json(self, path: str) -> str:
+        def operation() -> dict[str, Any]:
+            target = self._resolve_read(path)
+            if not target.exists():
+                raise ValueError("path_not_found")
+            if not target.is_file() or target.is_symlink():
+                raise ValueError("not_a_regular_file")
+            if target.suffix.lower() != ".json":
+                raise ValueError("unsupported_extension")
+            if target.stat().st_size > MAX_READ_BYTES:
+                raise ValueError("file_too_large")
+            try:
+                data = json.loads(target.read_text(encoding="utf-8-sig"))
+            except json.JSONDecodeError:
+                raise ValueError("invalid_json") from None
+            result: dict[str, Any] = {
+                "ok": True,
+                "path": self._relative(target),
+                "root_type": self._json_type(data),
+                "sha256": self._sha256(target),
+            }
+            if isinstance(data, dict):
+                result.update(
+                    {
+                        "item_count": len(data),
+                        "keys": list(data)[:100],
+                        "field_types": {
+                            key: self._json_type(value)
+                            for key, value in list(data.items())[:100]
+                        },
+                        "null_fields": [key for key, value in data.items() if value is None][:100],
+                    }
+                )
+            elif isinstance(data, list):
+                result.update(
+                    {
+                        "item_count": len(data),
+                        "element_types": sorted({self._json_type(item) for item in data}),
+                    }
+                )
+                first_object = next((item for item in data if isinstance(item, dict)), None)
+                if first_object is not None:
+                    result["sample_field_types"] = {
+                        key: self._json_type(value)
+                        for key, value in list(first_object.items())[:100]
+                    }
+            return result
+
+        return self._run("analyze_json", {"path": path}, operation)
+
     def write_output(self, path: str, content: str) -> str:
         def operation() -> dict[str, Any]:
             target = self._resolve_output(path)
@@ -221,6 +434,11 @@ class WorkspaceTools:
             encoded = content.encode("utf-8")
             if len(encoded) > MAX_WRITE_BYTES:
                 raise ValueError("content_too_large")
+            if target.suffix.lower() == ".json":
+                try:
+                    json.loads(content)
+                except json.JSONDecodeError:
+                    raise ValueError("invalid_json_content") from None
             target.parent.mkdir(parents=True, exist_ok=True)
             temp_path: Path | None = None
             try:
@@ -242,19 +460,28 @@ class WorkspaceTools:
                 "ok": True,
                 "path": self._relative(target),
                 "bytes": len(encoded),
+                "sha256": hashlib.sha256(encoded).hexdigest(),
             }
 
         return self._run("write_output", {"path": path, "content": content}, operation)
 
-    def _run_command(self, command: list[str]) -> subprocess.CompletedProcess[str]:
+    def _run_command(
+        self,
+        command: list[str],
+        timeout: int = 5,
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             command,
             cwd=self.root,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=timeout,
             check=False,
         )
+
+    @staticmethod
+    def _bounded_output(value: str, limit: int = 8000) -> str:
+        return value if len(value) <= limit else value[:limit] + "\n<输出已截断>"
 
     def run_local_check(self, check: str) -> str:
         def operation() -> dict[str, Any]:
@@ -282,6 +509,36 @@ class WorkspaceTools:
 
         return self._run("run_local_check", {"check": check}, operation)
 
+    def run_project_check(self, check: str) -> str:
+        def operation() -> dict[str, Any]:
+            checks = {
+                "pytest": [sys.executable, "-m", "pytest", "-q"],
+                "compileall": [
+                    sys.executable,
+                    "-m",
+                    "compileall",
+                    "-q",
+                    "src",
+                    "tests",
+                ],
+            }
+            command = checks.get(check)
+            if command is None:
+                raise ValueError("unsupported_project_check")
+            try:
+                completed = self._run_command(command, timeout=30)
+            except subprocess.TimeoutExpired:
+                raise ValueError("project_check_timeout") from None
+            return {
+                "ok": completed.returncode == 0,
+                "check": check,
+                "exit_code": completed.returncode,
+                "stdout": self._bounded_output(completed.stdout.strip()),
+                "stderr": self._bounded_output(completed.stderr.strip()),
+            }
+
+        return self._run("run_project_check", {"check": check}, operation)
+
     def as_agent_tools(self) -> list[Any]:
         controller = self
 
@@ -297,21 +554,43 @@ class WorkspaceTools:
 
         @tool
         def list_workspace(path: str = ".") -> str:
-            """列出 examples 或 workspace 允许目录下的文件。
+            """列出白名单项目目录或文件。
 
             Args:
-                path: 相对目录路径；传入点号表示全部允许目录。
+                path: 白名单相对路径；传入点号表示全部可读范围。
             """
             return controller.list_workspace(path)
 
         @tool
         def read_text(path: str) -> str:
-            """读取允许范围内的小型文本、Markdown、JSON 或 CSV 文件。
+            """读取白名单范围内不超过 64KB 的文本或配置文件。
 
             Args:
-                path: examples 或 workspace 下的相对路径。
+                path: 白名单目录或项目文件下的相对路径。
             """
             return controller.read_text(path)
+
+        @tool
+        def search_text(query: str, path: str = ".", max_results: int = 20) -> str:
+            """在白名单项目文件中进行不区分大小写的文本搜索。
+
+            Args:
+                query: 要搜索的非空文本。
+                path: 白名单目录、文件或点号表示全部可读范围。
+                max_results: 最多返回的匹配数，范围为 1 到 50。
+            """
+            return controller.search_text(query, path, max_results)
+
+        @tool
+        def read_text_chunk(path: str, start_line: int = 1, max_lines: int = 100) -> str:
+            """按行分段读取不超过 2MB 的白名单文本文件。
+
+            Args:
+                path: 白名单范围内的相对文件路径。
+                start_line: 从 1 开始的起始行号。
+                max_lines: 本次最多读取的行数，范围为 1 到 200。
+            """
+            return controller.read_text_chunk(path, start_line, max_lines)
 
         @tool
         def analyze_csv(path: str) -> str:
@@ -321,6 +600,15 @@ class WorkspaceTools:
                 path: examples 或 workspace 下的 CSV 相对路径。
             """
             return controller.analyze_csv(path)
+
+        @tool
+        def analyze_json(path: str) -> str:
+            """分析 JSON 的根类型、字段类型、空字段和集合规模。
+
+            Args:
+                path: 白名单范围内的 JSON 相对路径。
+            """
+            return controller.analyze_json(path)
 
         @tool
         def write_output(path: str, content: str) -> str:
@@ -341,11 +629,24 @@ class WorkspaceTools:
             """
             return controller.run_local_check(check)
 
+        @tool
+        def run_project_check(check: str) -> str:
+            """执行一项固定的项目检查，不接受额外命令行参数。
+
+            Args:
+                check: pytest 或 compileall 之一。
+            """
+            return controller.run_project_check(check)
+
         return [
             declare_intent,
             list_workspace,
             read_text,
+            search_text,
+            read_text_chunk,
             analyze_csv,
+            analyze_json,
             write_output,
             run_local_check,
+            run_project_check,
         ]

@@ -8,6 +8,8 @@ def demo_root(tmp_path: Path) -> Path:
     (tmp_path / "examples").mkdir()
     (tmp_path / "workspace/output").mkdir(parents=True)
     (tmp_path / "skills").mkdir()
+    (tmp_path / "src").mkdir()
+    (tmp_path / "tests").mkdir()
     (tmp_path / "skills/workspace.md").write_text(
         "先声明意图，再使用工具；每次写入后都要回读输出。",
         encoding="utf-8",
@@ -18,6 +20,18 @@ def demo_root(tmp_path: Path) -> Path:
     )
     (tmp_path / "examples/sales.csv").write_text(
         "product,units,revenue\nA,10,100\nB,20,300\nA,5,75\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "examples/config.json").write_text(
+        '{"service": "agent-demo", "enabled": true, "owner": null}',
+        encoding="utf-8",
+    )
+    (tmp_path / "src/demo.py").write_text(
+        "import subprocess\n\nsubprocess.run(['echo', 'demo'], check=False)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests/test_sample.py").write_text(
+        "def test_sample():\n    assert True\n",
         encoding="utf-8",
     )
     return tmp_path

@@ -8,7 +8,8 @@ from smolagents.models import (
     MessageRole,
 )
 
-from agent_demo.main import run_task
+from agent_demo.main import run_task, validate_trace
+from agent_demo.tools import Trace
 
 
 class ScriptedModel(Model):
@@ -118,3 +119,86 @@ def test_missing_source_fails_instead_of_fabricating(demo_root: Path) -> None:
     assert outcome.state == "failed"
     assert not (demo_root / "workspace/output/sales-report.md").exists()
     assert any(event["event"] == "validation.failed" for event in outcome.events)
+
+
+def test_search_uses_real_matches_and_verified_report(demo_root: Path) -> None:
+    report = "# subprocess 检查\n发现固定参数的 subprocess.run 调用。"
+    model = ScriptedModel(
+        [
+            (
+                "declare_intent",
+                {"intent": "search_files", "plan": "搜索 → 读取 → 写入 → 回读"},
+            ),
+            ("search_text", {"query": "subprocess", "path": "src", "max_results": 20}),
+            ("read_text", {"path": "src/demo.py"}),
+            ("write_output", {"path": "subprocess-audit.md", "content": report}),
+            ("read_text", {"path": "workspace/output/subprocess-audit.md"}),
+            ("final_answer", {"answer": "已生成并验证 subprocess-audit.md"}),
+        ]
+    )
+
+    outcome = run_task("检查 subprocess 使用并生成报告", root=demo_root, model=model, emit_trace=False)
+
+    assert outcome.state == "success"
+    assert tool_calls(outcome) == [
+        "declare_intent",
+        "search_text",
+        "read_text",
+        "write_output",
+        "read_text",
+    ]
+    assert any(event["event"] == "validation.passed" for event in outcome.events)
+
+
+def test_json_analysis_and_project_check_intents(demo_root: Path) -> None:
+    json_model = ScriptedModel(
+        [
+            ("declare_intent", {"intent": "analyze_json", "plan": "分析 JSON → 回答"}),
+            ("analyze_json", {"path": "examples/config.json"}),
+            ("final_answer", {"answer": "配置包含 service、enabled 和 owner。"}),
+        ]
+    )
+    json_outcome = run_task("分析配置文件", root=demo_root, model=json_model, emit_trace=False)
+    assert json_outcome.state == "success"
+    assert tool_calls(json_outcome) == ["declare_intent", "analyze_json"]
+
+    check_model = ScriptedModel(
+        [
+            ("declare_intent", {"intent": "project_check", "plan": "执行编译检查 → 回答"}),
+            ("run_project_check", {"check": "compileall"}),
+            ("final_answer", {"answer": "编译检查通过。"}),
+        ]
+    )
+    check_outcome = run_task("执行项目编译检查", root=demo_root, model=check_model, emit_trace=False)
+    assert check_outcome.state == "success"
+    assert tool_calls(check_outcome) == ["declare_intent", "run_project_check"]
+
+
+def test_trace_rejects_output_hash_mismatch() -> None:
+    trace = Trace(emit=False)
+    trace.record("tool.called", tool="declare_intent", arguments={})
+    trace.record("intent.declared", intent="summarize_text", plan="读取 → 写入 → 回读")
+    trace.record("tool.result", tool="declare_intent", result={"ok": True})
+    trace.record("tool.called", tool="read_text", arguments={})
+    trace.record(
+        "tool.result",
+        tool="read_text",
+        result={"ok": True, "path": "examples/notes.md", "sha256": "source"},
+    )
+    trace.record("tool.called", tool="write_output", arguments={})
+    trace.record(
+        "tool.result",
+        tool="write_output",
+        result={"ok": True, "path": "workspace/output/summary.md", "sha256": "expected"},
+    )
+    trace.record("tool.called", tool="read_text", arguments={})
+    trace.record(
+        "tool.result",
+        tool="read_text",
+        result={"ok": True, "path": "workspace/output/summary.md", "sha256": "actual"},
+    )
+
+    assert validate_trace(trace) == (
+        False,
+        "output_hash_mismatch:workspace/output/summary.md",
+    )

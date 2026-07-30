@@ -1,0 +1,9 @@
+{
+  "service": "agent-demo",
+  "model": "deepseek-v4-pro",
+  "features": {
+    "trace": true,
+    "read_back_validation": true
+  },
+  "owner": null
+}

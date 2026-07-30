@@ -15,10 +15,24 @@ from .tools import Trace, WorkspaceTools
 
 REQUIRED_TOOLS = {
     "inspect_files": {"list_workspace"},
+    "search_files": {"search_text"},
+    "read_large_text": {"read_text_chunk"},
     "summarize_text": {"read_text", "write_output"},
     "analyze_csv": {"analyze_csv", "write_output"},
+    "analyze_json": {"analyze_json"},
+    "project_check": {"run_project_check"},
     "system_check": {"run_local_check"},
-    "mixed": {"list_workspace", "analyze_csv", "write_output"},
+}
+TOOL_CATEGORIES = {
+    "list_workspace": "files",
+    "read_text": "files",
+    "search_text": "files",
+    "read_text_chunk": "files",
+    "write_output": "files",
+    "analyze_csv": "data",
+    "analyze_json": "data",
+    "run_local_check": "system",
+    "run_project_check": "system",
 }
 
 
@@ -105,20 +119,38 @@ def validate_trace(trace: Trace) -> tuple[bool, str]:
     if intent == "unsupported":
         return (not business_calls, "unsupported_request_must_not_execute_tools")
 
-    required = REQUIRED_TOOLS[intent]
     successful = {
         event["tool"]
         for event in trace.events
         if event["event"] == "tool.result" and event["result"].get("ok") is True
     }
-    if not required.issubset(successful):
-        return False, f"missing_successful_tools:{','.join(sorted(required - successful))}"
+    if intent == "mixed":
+        successful_business = successful - {"declare_intent"}
+        categories = {TOOL_CATEGORIES[name] for name in successful_business}
+        if len(categories) < 2:
+            return False, "mixed_requires_two_successful_tool_categories"
+    else:
+        required = REQUIRED_TOOLS[intent]
+        if not required.issubset(successful):
+            return False, f"missing_successful_tools:{','.join(sorted(required - successful))}"
 
     writes = _successful_results(trace.events, "write_output")
     reads = _successful_results(trace.events, "read_text")
     for write_index, write in writes:
-        if not any(index > write_index and read.get("path") == write.get("path") for index, read in reads):
+        read_back = next(
+            (
+                read
+                for index, read in reads
+                if index > write_index and read.get("path") == write.get("path")
+            ),
+            None,
+        )
+        if read_back is None:
             return False, f"output_not_read_back:{write.get('path')}"
+        if read_back.get("sha256") != write.get("sha256"):
+            return False, f"output_hash_mismatch:{write.get('path')}"
+        if str(write.get("path", "")).endswith(".json") and read_back.get("json_valid") is not True:
+            return False, f"invalid_json_output:{write.get('path')}"
     return True, "closed_loop_verified"
 
 
@@ -136,7 +168,11 @@ def _fallback_summary(trace: Trace) -> str:
         (event["result"] for event in successful if event["tool"] == "analyze_csv"),
         None,
     )
-    checks = [event["result"] for event in successful if event["tool"] == "run_local_check"]
+    checks = [
+        event["result"]
+        for event in successful
+        if event["tool"] in {"run_local_check", "run_project_check"}
+    ]
     if written:
         text = f"已完成并验证输出：{written['path']}"
         if analysis:
@@ -149,9 +185,17 @@ def _fallback_summary(trace: Trace) -> str:
                 text += f"，最高收入分组 {top['group']}（{top['value']}）"
         return text + "。"
     if checks:
-        return "；".join(f"{item['check']}: {item.get('value', '')}" for item in checks)
+        return "；".join(
+            f"{item['check']}: {item.get('value', item.get('stdout', ''))}"
+            for item in checks
+        )
     inspected = next(
-        (event["result"] for event in reversed(successful) if event["tool"] in {"read_text", "list_workspace"}),
+        (
+            event["result"]
+            for event in reversed(successful)
+            if event["tool"]
+            in {"read_text", "read_text_chunk", "list_workspace", "search_text", "analyze_json"}
+        ),
         None,
     )
     if inspected:
